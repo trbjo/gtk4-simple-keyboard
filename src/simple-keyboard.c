@@ -339,25 +339,32 @@ static void handle_keyboard_add(struct wl_keyboard *keyboard, struct wl_seat *se
     wl_keyboard_add_listener(keyboard, &keyboard_listener, state);
 }
 
+static void remove_keyboard_if_exists(struct wl_seat *seat) {
+    struct keyboard_list *list = keyboard_lists;
+
+    while (list) {
+        struct keyboard_node *current = list->keyboards;
+
+        while (current) {
+            struct keyboard_node *next = current->next;  // Save next before potential removal
+            if (current->state && current->state->seat == seat) {
+                handle_keyboard_remove(current->state->keyboard);
+                // handle_keyboard_remove already removes it from the list
+                // so we don't need to do anything else here
+            }
+            current = next;
+        }
+        list = list->next;
+    }
+}
+
 static void seat_handle_capabilities(void *data, struct wl_seat *seat,
                                   uint32_t capabilities) {
     struct seat_node *seat_node = data;
 
-    if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD)) {
-        struct keyboard_list *list = keyboard_lists;
-        while (list) {
-            struct keyboard_node *current = list->keyboards;
-            while (current) {
-                struct keyboard_node *next = current->next;
-                if (current->state->seat == seat) {
-                    handle_keyboard_remove(current->state->keyboard);
-                }
-                current = next;
-            }
-            list = list->next;
-        }
-    }
-    else if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
+    remove_keyboard_if_exists(seat);
+
+    if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
         struct wl_keyboard *keyboard = wl_seat_get_keyboard(seat);
         handle_keyboard_add(keyboard, seat, seat_node);
     }
