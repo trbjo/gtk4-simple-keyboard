@@ -1,14 +1,16 @@
-#include <gdk/wayland/gdkwayland.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include <linux/input.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 #include "simple-keyboard.h"
 
-static void dummy_focus() {}
-static void dummy_key(xkb_keysym_t key, GdkModifierType mods) {}
+static void dummy_focus(void) {}
+static void dummy_key(uint32_t key, SkModifierType mods) { (void)key; (void)mods; }
 
 static struct wl_surface *target_surface = NULL;
 static focus_callback global_focus_enter = dummy_focus;
@@ -17,8 +19,7 @@ static key_callback global_press_cb = dummy_key;
 static key_callback global_release_cb = dummy_key;
 
 static struct wl_display *global_wl_display;
-
-static gboolean key_repeat_callback(gpointer user_data);
+static int repeat_timer_fd = -1;
 
 struct seat_node {
     uint32_t name;
@@ -29,11 +30,9 @@ struct seat_node {
 struct repeat_data {
     uint32_t key;           // The physical key code that's repeating
     xkb_keysym_t keysym;    // The translated value at time of press
-    GdkModifierType modifiers;
-    guint timer;
-    int32_t rate;    // repeats per second
-    int32_t delay;   // initial delay in milliseconds
-    struct wl_callback *callback;
+    SkModifierType modifiers;
+    int32_t rate;           // repeats per second
+    int32_t delay;          // initial delay in milliseconds
     struct keyboard_state *keyboard;  // Back-reference to containing keyboard
 };
 
@@ -49,6 +48,13 @@ struct keyboard_state {
     struct seat_node *seat_node;  // Back-reference to containing seat
     int has_focus;
     void *user_data;
+
+    // Cached modifier indices for fast lookup
+    xkb_mod_index_t mod_shift;
+    xkb_mod_index_t mod_ctrl;
+    xkb_mod_index_t mod_alt;
+    xkb_mod_index_t mod_super;
+    xkb_mod_index_t mod_caps;
 };
 
 struct keyboard_node {
@@ -62,62 +68,76 @@ struct keyboard_list {
 };
 
 static struct keyboard_list *keyboard_lists = NULL;
+static struct keyboard_state *repeating_keyboard = NULL;
 
-static GdkModifierType get_modifiers_state(struct xkb_state *state) {
-    GdkModifierType mods = 0;
-    if (xkb_state_mod_name_is_active(state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0)
-        mods |= GDK_SHIFT_MASK;
-    if (xkb_state_mod_name_is_active(state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0)
-        mods |= GDK_CONTROL_MASK;
-    if (xkb_state_mod_name_is_active(state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0)
-        mods |= GDK_ALT_MASK;
-    if (xkb_state_mod_name_is_active(state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE) > 0)
-        mods |= GDK_SUPER_MASK;
-    if (xkb_state_mod_name_is_active(state, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_EFFECTIVE) > 0)
-        mods |= GDK_LOCK_MASK;
+static void arm_timer(int delay_ms) {
+    if (repeat_timer_fd < 0) return;
+
+    struct itimerspec ts = {0};
+    ts.it_value.tv_sec = delay_ms / 1000;
+    ts.it_value.tv_nsec = (delay_ms % 1000) * 1000000L;
+    // One-shot timer (it_interval stays zero)
+
+    timerfd_settime(repeat_timer_fd, 0, &ts, NULL);
+}
+
+static void disarm_timer(void) {
+    if (repeat_timer_fd < 0) return;
+
+    struct itimerspec ts = {0};
+    timerfd_settime(repeat_timer_fd, 0, &ts, NULL);
+}
+
+static SkModifierType get_modifiers_state(struct keyboard_state *kstate) {
+    SkModifierType mods = 0;
+    xkb_mod_mask_t mask = xkb_state_serialize_mods(kstate->xkb_state, XKB_STATE_MODS_EFFECTIVE);
+
+    if (kstate->mod_shift != XKB_MOD_INVALID && (mask & (1 << kstate->mod_shift)))
+        mods |= SK_SHIFT_MASK;
+    if (kstate->mod_ctrl != XKB_MOD_INVALID && (mask & (1 << kstate->mod_ctrl)))
+        mods |= SK_CONTROL_MASK;
+    if (kstate->mod_alt != XKB_MOD_INVALID && (mask & (1 << kstate->mod_alt)))
+        mods |= SK_ALT_MASK;
+    if (kstate->mod_super != XKB_MOD_INVALID && (mask & (1 << kstate->mod_super)))
+        mods |= SK_SUPER_MASK;
+    if (kstate->mod_caps != XKB_MOD_INVALID && (mask & (1 << kstate->mod_caps)))
+        mods |= SK_LOCK_MASK;
+
     return mods;
 }
 
-static void sync_callback(void *data, struct wl_callback *callback, uint32_t time) {
-    struct keyboard_state *state = data;
-
-    wl_callback_destroy(callback);
-    state->repeat.callback = NULL;
-
-    global_press_cb(state->repeat.keysym, state->repeat.modifiers);
-
-    if (state->repeat.rate > 0) {
-        int timeout = 1000 / state->repeat.rate;
-        state->repeat.timer = g_timeout_add(timeout, key_repeat_callback, state);
-    }
+int keyboard_get_repeat_fd(void) {
+    return repeat_timer_fd;
 }
 
-static const struct wl_callback_listener sync_callback_listener = {
-  sync_callback
-};
+void keyboard_handle_repeat(void) {
+    if (repeat_timer_fd < 0 || !repeating_keyboard)
+        return;
 
-static gboolean key_repeat_callback(gpointer user_data) {
-    struct keyboard_state *state = user_data;
-    state->repeat.callback = wl_display_sync(global_wl_display);
+    // Read and discard the timer expiration count
+    uint64_t expirations;
+    if (read(repeat_timer_fd, &expirations, sizeof(expirations)) != sizeof(expirations))
+        return;
 
-    wl_callback_add_listener(state->repeat.callback, &sync_callback_listener, state);
+    struct keyboard_state *state = repeating_keyboard;
 
-    state->repeat.timer = 0;
-    return G_SOURCE_REMOVE;
+    // Call the press callback directly
+    global_press_cb(state->repeat.keysym, state->repeat.modifiers);
+
+    // Re-arm timer for next repeat
+    if (state->repeat.rate > 0) {
+        int timeout = 1000 / state->repeat.rate;
+        arm_timer(timeout);
+    }
 }
 
 static void stop_repeat(struct keyboard_state *kstate) {
     if (!kstate)
         return;
 
-    if (kstate->repeat.timer) {
-        g_source_remove(kstate->repeat.timer);
-        kstate->repeat.timer = 0;
-    }
-
-    if (kstate->repeat.callback) {
-        wl_callback_destroy(kstate->repeat.callback);
-        kstate->repeat.callback = NULL;
+    if (repeating_keyboard == kstate) {
+        disarm_timer();
+        repeating_keyboard = NULL;
     }
 
     kstate->repeat.keysym = 0;
@@ -125,7 +145,7 @@ static void stop_repeat(struct keyboard_state *kstate) {
     kstate->repeat.keyboard = NULL;
 }
 
-static int any_keyboard_has_focus() {
+static int any_keyboard_has_focus(void) {
     struct keyboard_list *list = keyboard_lists;
 
     while (list) {
@@ -142,7 +162,8 @@ static int any_keyboard_has_focus() {
 }
 
 static void keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard,
-                                uint32_t format, int fd, uint32_t size) {
+                                   uint32_t format, int fd, uint32_t size) {
+    (void)keyboard;
     struct keyboard_state *state = data;
     char *map_str;
 
@@ -159,23 +180,33 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard,
 
     state->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     state->keymap = xkb_keymap_new_from_string(state->xkb_context, map_str,
-                                             XKB_KEYMAP_FORMAT_TEXT_V1,
-                                             XKB_KEYMAP_COMPILE_NO_FLAGS);
+                                               XKB_KEYMAP_FORMAT_TEXT_V1,
+                                               XKB_KEYMAP_COMPILE_NO_FLAGS);
     state->xkb_state = xkb_state_new(state->keymap);
+
+    // Cache modifier indices for fast lookup in hot path
+    state->mod_shift = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_SHIFT);
+    state->mod_ctrl = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_CTRL);
+    state->mod_alt = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_ALT);
+    state->mod_super = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_LOGO);
+    state->mod_caps = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_CAPS);
 
     munmap(map_str, size);
     close(fd);
 }
 
 static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
-                              uint32_t serial, uint32_t time, uint32_t key,
-                              uint32_t state) {
+                                uint32_t serial, uint32_t time, uint32_t key,
+                                uint32_t state) {
+    (void)keyboard;
+    (void)serial;
+    (void)time;
     struct keyboard_state *kstate = data;
 
     if (!kstate->xkb_state || !kstate->has_focus) return;
 
     xkb_keysym_t keysym = xkb_state_key_get_one_sym(kstate->xkb_state, key + 8);
-    GdkModifierType modifiers = get_modifiers_state(kstate->xkb_state);
+    SkModifierType modifiers = get_modifiers_state(kstate);
 
     if (state == 1) { // Key press
         // Only stop repeat if it's a different key
@@ -186,13 +217,15 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
         global_press_cb(keysym, modifiers);
 
         // Set up repeat if not already repeating this key
-        if (kstate->repeat.rate > 0 && kstate->repeat.keysym != keysym && xkb_keymap_key_repeats(kstate->keymap, key + 8)) {
+        if (kstate->repeat.rate > 0 && kstate->repeat.keysym != keysym &&
+            xkb_keymap_key_repeats(kstate->keymap, key + 8)) {
             kstate->repeat.keysym = keysym;
             kstate->repeat.key = key;
             kstate->repeat.modifiers = modifiers;
             kstate->repeat.keyboard = kstate;
 
-            kstate->repeat.timer = g_timeout_add(kstate->repeat.delay, key_repeat_callback, kstate);
+            repeating_keyboard = kstate;
+            arm_timer(kstate->repeat.delay);
         }
     } else if (state == 0) { // Key release
         if (kstate->repeat.key == key || (kstate->repeat.key != 0 && modifiers)) {
@@ -204,8 +237,11 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 }
 
 static void keyboard_handle_enter(void *data, struct wl_keyboard *keyboard,
-                                uint32_t serial, struct wl_surface *surface,
-                                struct wl_array *keys) {
+                                  uint32_t serial, struct wl_surface *surface,
+                                  struct wl_array *keys) {
+    (void)keyboard;
+    (void)serial;
+    (void)keys;
     struct keyboard_state *state = data;
     if (surface != target_surface) return;
 
@@ -216,7 +252,9 @@ static void keyboard_handle_enter(void *data, struct wl_keyboard *keyboard,
 }
 
 static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
-                               uint32_t serial, struct wl_surface *surface) {
+                                  uint32_t serial, struct wl_surface *surface) {
+    (void)keyboard;
+    (void)serial;
     struct keyboard_state *kstate = data;
 
     if (surface != target_surface) return;
@@ -231,19 +269,22 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
 }
 
 static void keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard,
-                                   uint32_t serial, uint32_t mods_depressed,
-                                   uint32_t mods_latched, uint32_t mods_locked,
-                                   uint32_t group) {
+                                      uint32_t serial, uint32_t mods_depressed,
+                                      uint32_t mods_latched, uint32_t mods_locked,
+                                      uint32_t group) {
+    (void)keyboard;
+    (void)serial;
     struct keyboard_state *kstate = data;
     if (kstate->xkb_state) {
         xkb_state_update_mask(kstate->xkb_state,
-                            mods_depressed, mods_latched, mods_locked,
-                            0, 0, group);
+                              mods_depressed, mods_latched, mods_locked,
+                              0, 0, group);
     }
 }
 
 static void keyboard_handle_repeat_info(void *data, struct wl_keyboard *keyboard,
-                                     int32_t rate, int32_t delay) {
+                                        int32_t rate, int32_t delay) {
+    (void)keyboard;
     struct keyboard_state *state = data;
     state->repeat.rate = rate;
     state->repeat.delay = delay;
@@ -359,7 +400,7 @@ static void remove_keyboard_if_exists(struct wl_seat *seat) {
 }
 
 static void seat_handle_capabilities(void *data, struct wl_seat *seat,
-                                  uint32_t capabilities) {
+                                     uint32_t capabilities) {
     struct seat_node *seat_node = data;
 
     remove_keyboard_if_exists(seat);
@@ -371,7 +412,10 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat,
 }
 
 static void seat_handle_name(void *data, struct wl_seat *seat,
-                          const char *name) {
+                             const char *name) {
+    (void)data;
+    (void)seat;
+    (void)name;
     // Optional: could store seat names if needed
 }
 
@@ -381,12 +425,13 @@ static const struct wl_seat_listener seat_listener = {
 };
 
 static void registry_handle_global(void *data, struct wl_registry *registry,
-                                uint32_t name, const char *interface,
-                                uint32_t version) {
+                                   uint32_t name, const char *interface,
+                                   uint32_t version) {
+    (void)data;
     if (strcmp(interface, wl_seat_interface.name) == 0) {
         struct wl_seat *seat = wl_registry_bind(registry, name,
-                                             &wl_seat_interface,
-                                             version < 7 ? version : 7);
+                                                &wl_seat_interface,
+                                                version < 7 ? version : 7);
 
         // Add to seat list
         struct seat_node *node = malloc(sizeof(struct seat_node));
@@ -401,7 +446,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 }
 
 static void registry_handle_global_remove(void *data, struct wl_registry *registry,
-                                       uint32_t name) {
+                                          uint32_t name) {
+    (void)data;
+    (void)registry;
     struct seat_node *current = seat_list;
     struct seat_node *prev = NULL;
 
@@ -447,7 +494,10 @@ static void init_keyboard(void) {
     wl_display_roundtrip(global_wl_display); // Ensure we get all initial seats
 }
 
-void teardown() {
+void keyboard_teardown(void) {
+    disarm_timer();
+    repeating_keyboard = NULL;
+
     while (keyboard_lists) {
         struct keyboard_list *current_list = keyboard_lists;
         keyboard_lists = current_list->next;
@@ -479,25 +529,35 @@ void teardown() {
 
     seat_list = NULL;
     keyboard_lists = NULL;
+
+    if (repeat_timer_fd >= 0) {
+        close(repeat_timer_fd);
+        repeat_timer_fd = -1;
+    }
 }
 
-void initialize(struct wl_surface *surface,
-               key_callback press_cb,
-               key_callback release_cb,
-               focus_callback cb_focus_enter,
-               focus_callback cb_focus_leave) {
+void keyboard_initialize(struct wl_surface *surface,
+                         key_callback press_cb,
+                         key_callback release_cb,
+                         focus_callback cb_focus_enter,
+                         focus_callback cb_focus_leave) {
     target_surface = surface;
     global_press_cb = press_cb;
     global_release_cb = release_cb;
     global_focus_enter = cb_focus_enter;
     global_focus_leave = cb_focus_leave;
 
-    GdkWaylandDisplay *wl_display = GDK_WAYLAND_DISPLAY(gdk_display_get_default());
-    if (!wl_display) {
-        printf("Not running under Wayland\n");
+    global_wl_display = wl_proxy_get_display((struct wl_proxy *)surface);
+    if (!global_wl_display) {
+        fprintf(stderr, "simple-keyboard: failed to get wl_display from surface\n");
         return;
     }
 
-    global_wl_display = gdk_wayland_display_get_wl_display(wl_display);
+    repeat_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (repeat_timer_fd < 0) {
+        fprintf(stderr, "simple-keyboard: failed to create timerfd\n");
+        return;
+    }
+
     init_keyboard();
 }
