@@ -1,5 +1,6 @@
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-compose.h>
 #include <linux/input.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
@@ -7,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <locale.h>
 #include "simple-keyboard.h"
 
 static void dummy_focus(void) {}
@@ -42,6 +44,8 @@ struct keyboard_state {
     struct xkb_state *xkb_state;
     struct xkb_context *xkb_context;
     struct xkb_keymap *keymap;
+    struct xkb_compose_table *compose_table;
+    struct xkb_compose_state *compose_state;
     struct wl_keyboard *keyboard;
     struct wl_seat *seat;
     struct repeat_data repeat;
@@ -184,6 +188,17 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard,
                                                XKB_KEYMAP_COMPILE_NO_FLAGS);
     state->xkb_state = xkb_state_new(state->keymap);
 
+    state->compose_table = xkb_compose_table_new_from_locale(
+        state->xkb_context,
+        setlocale(LC_CTYPE, NULL) ?: "C",
+        XKB_COMPOSE_COMPILE_NO_FLAGS);
+
+    if (state->compose_table) {
+        state->compose_state = xkb_compose_state_new(
+            state->compose_table,
+            XKB_COMPOSE_STATE_NO_FLAGS);
+    }
+
     // Cache modifier indices for fast lookup in hot path
     state->mod_shift = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_SHIFT);
     state->mod_ctrl = xkb_keymap_mod_get_index(state->keymap, XKB_MOD_NAME_CTRL);
@@ -209,6 +224,30 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
     SkModifierType modifiers = get_modifiers_state(kstate);
 
     if (state == 1) { // Key press
+        if (kstate->compose_state) {
+            enum xkb_compose_feed_result feed =
+                xkb_compose_state_feed(kstate->compose_state, keysym);
+
+            if (feed == XKB_COMPOSE_FEED_ACCEPTED) {
+                enum xkb_compose_status status =
+                    xkb_compose_state_get_status(kstate->compose_state);
+
+                switch (status) {
+                case XKB_COMPOSE_COMPOSING:
+                    return;  // swallow intermediate keys
+                case XKB_COMPOSE_COMPOSED:
+                    keysym = xkb_compose_state_get_one_sym(kstate->compose_state);
+                    xkb_compose_state_reset(kstate->compose_state);
+                    break;
+                case XKB_COMPOSE_CANCELLED:
+                    xkb_compose_state_reset(kstate->compose_state);
+                    return;  // swallow the cancelled key
+                case XKB_COMPOSE_NOTHING:
+                    break;
+                }
+            }
+        }
+
         // Only stop repeat if it's a different key
         if (kstate->repeat.keysym != keysym) {
             stop_repeat(kstate);
@@ -327,6 +366,14 @@ static void handle_keyboard_remove(struct wl_keyboard *keyboard) {
                 }
 
                 // Now safely cleanup xkb state
+                if (current->state->compose_state) {
+                    xkb_compose_state_unref(current->state->compose_state);
+                    current->state->compose_state = NULL;
+                }
+                if (current->state->compose_table) {
+                    xkb_compose_table_unref(current->state->compose_table);
+                    current->state->compose_table = NULL;
+                }
                 if (current->state->xkb_state) {
                     xkb_state_unref(current->state->xkb_state);
                     current->state->xkb_state = NULL;
