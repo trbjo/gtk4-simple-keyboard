@@ -19,6 +19,7 @@ static focus_callback global_focus_enter = dummy_focus;
 static focus_callback global_focus_leave = dummy_focus;
 static key_callback global_press_cb = dummy_key;
 static key_callback global_release_cb = dummy_key;
+static compose_callback global_compose_cb = NULL;
 
 static struct wl_display *global_wl_display;
 static int repeat_timer_fd = -1;
@@ -234,13 +235,31 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 
                 switch (status) {
                 case XKB_COMPOSE_COMPOSING:
+                    if (global_compose_cb) {
+                        char buf[64];
+                        int len = xkb_compose_state_get_utf8(kstate->compose_state, buf, sizeof(buf));
+                        if (len == 0) {
+                            uint32_t cp = xkb_keysym_to_utf32(keysym);
+                            if (cp != 0) {
+                                len = xkb_keysym_to_utf8(keysym, buf, sizeof(buf));
+                            } else {
+                                // Non-character key (Multi_key, dead keys) —
+                                // show middle dot as compose indicator
+                                buf[0] = '\xc2'; buf[1] = '\xb7'; buf[2] = '\0';
+                                len = 2;
+                            }
+                        }
+                        global_compose_cb(buf);
+                    }
                     return;  // swallow intermediate keys
                 case XKB_COMPOSE_COMPOSED:
                     keysym = xkb_compose_state_get_one_sym(kstate->compose_state);
                     xkb_compose_state_reset(kstate->compose_state);
+                    if (global_compose_cb) global_compose_cb(NULL);
                     break;
                 case XKB_COMPOSE_CANCELLED:
                     xkb_compose_state_reset(kstate->compose_state);
+                    if (global_compose_cb) global_compose_cb(NULL);
                     return;  // swallow the cancelled key
                 case XKB_COMPOSE_NOTHING:
                     break;
@@ -298,6 +317,11 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
 
     if (surface != target_surface) return;
     kstate->has_focus = 0;
+
+    if (kstate->compose_state) {
+        xkb_compose_state_reset(kstate->compose_state);
+        if (global_compose_cb) global_compose_cb(NULL);
+    }
 
     stop_repeat(kstate);
 
@@ -587,12 +611,14 @@ void keyboard_initialize(struct wl_surface *surface,
                          key_callback press_cb,
                          key_callback release_cb,
                          focus_callback cb_focus_enter,
-                         focus_callback cb_focus_leave) {
+                         focus_callback cb_focus_leave,
+                         compose_callback compose_cb) {
     target_surface = surface;
     global_press_cb = press_cb;
     global_release_cb = release_cb;
     global_focus_enter = cb_focus_enter;
     global_focus_leave = cb_focus_leave;
+    global_compose_cb = compose_cb;
 
     global_wl_display = wl_proxy_get_display((struct wl_proxy *)surface);
     if (!global_wl_display) {

@@ -16,14 +16,17 @@ struct wl_surface;
 
 typedef void (*key_callback)(uint32_t keyval, SkModifierType modifiers);
 typedef void (*focus_callback)(void);
+typedef void (*compose_callback)(const char *preedit);
 
 // Initialize keyboard handling for the given surface.
 // The wl_display is derived from the surface automatically.
+// compose_cb is called with a string during compose, and NULL when compose ends.
 void keyboard_initialize(struct wl_surface *target_surface,
                          key_callback press_cb,
                          key_callback release_cb,
                          focus_callback cb_focus_enter,
-                         focus_callback cb_focus_leave);
+                         focus_callback cb_focus_leave,
+                         compose_callback compose_cb);
 
 // Returns the file descriptor for key repeat timing.
 // Add this to your event loop (poll/epoll/etc) and call

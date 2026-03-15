@@ -16,8 +16,11 @@ namespace SimpleKeyboard {
     [CCode (cname = "focus_callback", has_target = false)]
     public delegate void FocusCallback();
 
+    [CCode (cname = "compose_callback", has_target = false)]
+    public delegate void ComposeCallback(string? preedit);
+
     [CCode (cname = "keyboard_initialize")]
-    public void initialize(Wl.Surface? surface, KeyCallback press_cb, KeyCallback release_cb, FocusCallback focus_enter_cb, FocusCallback focus_leave_cb);
+    public void initialize(Wl.Surface? surface, KeyCallback press_cb, KeyCallback release_cb, FocusCallback focus_enter_cb, FocusCallback focus_leave_cb, ComposeCallback? compose_cb);
 
     [CCode (cname = "keyboard_get_repeat_fd")]
     public int get_repeat_fd();
